@@ -1,0 +1,254 @@
+name: Auto Sync and Build from Upstream
+
+on:
+  schedule:
+    # Run every day at 00:00 UTC (adjust as needed)
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check-and-sync:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      new_commits: ${{ steps.check.outputs.new_commits }}
+    
+
+steps:
+- name: Checkout your fork
+  uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+    
+- name: Add upstream remote
+  run: |
+    git remote add upstream https://github.com/zed-industries/zed.git
+    git fetch upstream main
+    
+- name: Check for new commits
+  id: check
+  run: |
+    # Get the latest commit from upstream
+    UPSTREAM_COMMIT=$(git rev-parse upstream/main)
+    LOCAL_COMMIT=$(git rev-parse HEAD)
+    
+    echo "Upstream commit: $UPSTREAM_COMMIT"
+    echo "Local commit: $LOCAL_COMMIT"
+    
+    if [ "$UPSTREAM_COMMIT" != "$LOCAL_COMMIT" ]; then
+      echo "should_build=true" >> $GITHUB_OUTPUT
+      NEW_COMMITS=$(git log --oneline HEAD..upstream/main | wc -l)
+      echo "new_commits=$NEW_COMMITS" >> $GITHUB_OUTPUT
+      echo "Found $NEW_COMMITS new commits from upstream"
+    else
+      echo "should_build=false" >> $GITHUB_OUTPUT
+      echo "new_commits=0" >> $GITHUB_OUTPUT
+      echo "No new commits from upstream"
+    fi
+    
+- name: Merge upstream changes
+  if: steps.check.outputs.should_build == 'true'
+  run: |
+    git config user.name "github-actions[bot]"
+    git config user.email "github-actions[bot]@users.noreply.github.com"
+    git merge upstream/main --no-edit
+    
+- name: Push changes
+  if: steps.check.outputs.should_build == 'true'
+  run: |
+    git push origin main
+  build:
+    needs: check-and-sync
+    if: needs.check-and-sync.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    
+
+steps:
+- name: Update system and install dependencies
+  run: |
+    pacman -Syu --noconfirm
+    pacman -S --noconfirm git base-devel rustup clang curl unzip jq gettext
+    
+- name: Initialize rustup
+  run: |
+    rustup default stable
+    
+- name: Checkout repository
+  uses: actions/checkout@v4
+  with:
+    clean: false
+    
+- name: Install Zed dependencies
+  run: |
+    bash script/linux
+    
+- name: Install Wild linker
+  run: |
+    bash script/install-wild || echo "Wild linker installation failed, continuing"
+    
+- name: Configure Cargo to use Wild linker
+  run: |
+    mkdir -p ~/.cargo
+    cat > ~/.cargo/config.toml << 'EOF'
+    [target.x86_64-unknown-linux-gnu]
+    linker = "clang"
+    rustflags = ["-C", "link-arg=--ld-path=wild"]
+    EOF
+  
+- name: Set release channel
+  run: |
+    echo -n "stable" > crates/zed/RELEASE_CHANNEL
+    
+- name: Build Zed (Release mode)
+  run: |
+    cargo build --release -p cli
+    cargo build --release -p zed
+    
+- name: Create installation directory structure
+  run: |
+    mkdir -p dist/bin
+    mkdir -p dist/libexec
+    mkdir -p dist/share/applications
+    mkdir -p dist/share/icons/hicolor/512x512/apps
+    mkdir -p dist/share/icons/hicolor/1024x1024/apps
+    
+- name: Copy binaries
+  run: |
+    cp target/release/cli dist/bin/zed
+    cp target/release/zed dist/libexec/zed-editor
+    chmod +x dist/bin/zed
+    chmod +x dist/libexec/zed-editor
+    
+- name: Create desktop file
+  run: |
+    export DO_STARTUP_NOTIFY="true"
+    export APP_CLI="zed"
+    export APP_ICON="zed"
+    export APP_NAME="Zed"
+    export APP_ARGS="%U"
+    envsubst < crates/zed/resources/zed.desktop.in > dist/share/applications/zed.desktop
+    
+- name: Copy icons
+  run: |
+    cp crates/zed/resources/app-icon.png dist/share/icons/hicolor/512x512/apps/zed.png || true
+    cp crates/zed/resources/app-icon@2x.png dist/share/icons/hicolor/1024x1024/apps/zed.png || true
+    
+- name: Create installation script
+  run: |
+    cat > dist/install.sh << 'EOF'
+    #!/bin/bash
+    set -e
+    
+    echo "Installing Zed for Arch Linux..."
+    
+    mkdir -p ~/.local/bin
+    mkdir -p ~/.local/libexec
+    mkdir -p ~/.local/share/applications
+    mkdir -p ~/.local/share/icons/hicolor/512x512/apps
+    mkdir -p ~/.local/share/icons/hicolor/1024x1024/apps
+    
+    cp bin/zed ~/.local/bin/zed
+    cp libexec/zed-editor ~/.local/libexec/zed-editor
+    cp share/applications/zed.desktop ~/.local/share/applications/
+    cp share/icons/hicolor/512x512/apps/zed.png ~/.local/share/icons/hicolor/512x512/apps/ 2>/dev/null || true
+    cp share/icons/hicolor/1024x1024/apps/zed.png ~/.local/share/icons/hicolor/1024x1024/apps/ 2>/dev/null || true
+    
+    chmod +x ~/.local/bin/zed
+    chmod +x ~/.local/libexec/zed-editor
+    
+    if command -v update-desktop-database &> /dev/null; then
+        update-desktop-database ~/.local/share/applications
+    fi
+    
+    if command -v gtk-update-icon-cache &> /dev/null; then
+        gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor 2>/dev/null || true
+    fi
+    
+    echo ""
+    echo "✓ Zed installed successfully!"
+    echo ""
+    echo "Make sure ~/.local/bin is in your PATH:"
+    echo '  export PATH="$HOME/.local/bin:$PATH"'
+    echo ""
+    echo "Run 'zed' to start the editor"
+    EOF
+    
+    chmod +x dist/install.sh
+    
+- name: Create README
+  run: |
+    cat > dist/README.md << 'EOF'
+    # Zed Editor - Arch Linux Build
+    
+    Auto-built from upstream: https://github.com/zed-industries/zed
+    
+    ## Installation
+    
+    1. Extract this archive
+    2. Run: `./install.sh`
+    3. Add to PATH: `export PATH="$HOME/.local/bin:$PATH"`
+    
+    ## Running
+    
+    ```bash
+    zed
+    ```
+    
+    ## Dependencies
+    
+    Install if missing:
+    ```bash
+    sudo pacman -S libxcb libxkbcommon vulkan-icd-loader fontconfig wayland
+    ```
+    EOF
+    
+- name: Create tarball
+  run: |
+    cd dist
+    tar -czf ../zed-arch-linux-x86_64.tar.gz .
+    cd ..
+    
+- name: Get current date
+  id: date
+  run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+    
+- name: Create automatic release
+  uses: softprops/action-gh-release@v1
+  with:
+    tag_name: auto-${{ steps.date.outputs.date }}-${{ github.run_number }}
+    name: Auto Build ${{ steps.date.outputs.date }}
+    body: |
+      Automated build from upstream Zed repository.
+      
+      **New commits from upstream:** ${{ needs.check-and-sync.outputs.new_commits }}
+      **Build date:** ${{ steps.date.outputs.date }}
+      
+      This build was automatically created when new commits were detected in the upstream repository.
+      
+      ## Installation
+      
+      1. Download `zed-arch-linux-x86_64.tar.gz`
+      2. Extract: `tar -xzf zed-arch-linux-x86_64.tar.gz`
+      3. Install: `cd zed-arch-linux-x86_64 && ./install.sh`
+      
+      ## Changes
+      
+      See upstream commits: https://github.com/zed-industries/zed/commits/main
+    files: zed-arch-linux-x86_64.tar.gz
+    draft: false
+    prerelease: false
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+- name: Upload artifact
+  uses: actions/upload-artifact@v4
+  with:
+    name: zed-arch-linux-x86_64-${{ steps.date.outputs.date }}
+    path: zed-arch-linux-x86_64.tar.gz
+    retention-days: 30
